@@ -7,9 +7,12 @@
   - الفيديو الرئيسي بعرض 16:9 (لليوتيوب).
   - مقاطع Shorts/Reels عمودية 9:16 مع قصّ تلقائي "ذكي" حول الوجه إن أمكن.
 
-يضمن الكود تطابق مدة كل مشهد (صورة + ترجمة) تماماً مع مدة الصوت الخاصة به
-(audio duration عبر ffprobe)، ولا يضيف أي موسيقى خلفية إطلاقاً، مع دعم
-اختياري لمؤثرات صوتية طبيعية إن توفرت ملفاتها محلياً في مجلد sfx_library/.
+بلا أي ترجمة أو نصوص مكتوبة على الفيديو إطلاقاً (الجمهور أطفال ما قبل
+المدرسة) — الصورة نظيفة تماماً بلا أي طبقة نص. يضمن الكود تطابق مدة عرض
+كل مشهد مع مدة الصوت الخاصة به تماماً (audio duration عبر ffprobe)، مع
+تأثير تحريك كاميرا (Zoom & Pan) ديناميكي هادئ لكل مشهد، ولا يضيف أي
+موسيقى خلفية إطلاقاً، مع دعم اختياري لمؤثرات صوتية طبيعية إن توفرت
+ملفاتها محلياً في مجلد sfx_library/.
 """
 
 import json
@@ -55,7 +58,7 @@ st.title("🎬 مُجمّع القصص إلى فيديو")
 st.caption(
     "ارفع ملف الـ ZIP الناتج من أداة توليد القصة (نص + صور + صوت)، "
     "واختر الفيديو الرئيسي (16:9) و/أو مقاطع Shorts عمودية (9:16) بقصّ "
-    "تلقائي، بدون أي موسيقى خلفية."
+    "تلقائي. صورة نظيفة بلا أي ترجمة أو نصوص، وبدون أي موسيقى خلفية."
 )
 
 # --------------------------------------------------------------------------
@@ -73,6 +76,7 @@ SFX_FILENAMES = {
     "children_laughing": "children_laughing.mp3",
     "footsteps": "footsteps.mp3",
     "wind": "wind.mp3",
+    "blocks": "blocks.mp3",
 }
 
 MODE_LANDSCAPE = "landscape"
@@ -92,8 +96,7 @@ MODE_LABELS = {
 with st.sidebar:
     st.header("⚙️ الإعدادات")
     output_choice_label = st.radio("نوع المخرج", list(OUTPUT_CHOICES.keys()), index=2)
-    add_subs = st.checkbox("حرق الترجمة النصية على الفيديو", value=True)
-    zoom_effect = st.checkbox("تأثير تكبير بطيء (Ken Burns)", value=True)
+    zoom_effect = st.checkbox("تأثير تحريك كاميرا هادئ (Ken Burns Zoom & Pan)", value=True)
     add_sfx = st.checkbox(
         "إضافة مؤثرات صوتية طبيعية إن توفرت ملفاتها (بدون أي موسيقى إطلاقاً)",
         value=True,
@@ -136,46 +139,6 @@ def get_duration(media_path: Path) -> float:
         "قراءة مدة الملف",
     )
     return float(result.stdout.strip())
-
-
-def format_srt_time(seconds: float) -> str:
-    if seconds < 0:
-        seconds = 0
-    total_ms = int(round(seconds * 1000))
-    hours, rem = divmod(total_ms, 3600 * 1000)
-    minutes, rem = divmod(rem, 60 * 1000)
-    secs, ms = divmod(rem, 1000)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
-
-
-def split_narration(text: str):
-    """يقسّم نص السرد إلى جمل قصيرة قابلة للعرض كترجمة."""
-    parts = re.split(r"(?<=[.!؟،])\s+", text.strip())
-    parts = [p.strip() for p in parts if p.strip()]
-    return parts if parts else [text.strip()]
-
-
-def build_scene_srt(narration: str, duration: float, out_path: Path):
-    """
-    يبني ملف SRT لمشهد واحد، بتوزيع المدة على الجمل حسب عدد الكلمات
-    (تقدير أدق من التوزيع الحرفي لأنه أقرب لمعدل النطق الفعلي).
-    """
-    chunks = split_narration(narration)
-    word_counts = [max(1, len(c.split())) for c in chunks]
-    total_words = sum(word_counts) or 1
-
-    lines = []
-    t = 0.0
-    for i, (chunk, wc) in enumerate(zip(chunks, word_counts), start=1):
-        share = wc / total_words
-        seg_dur = max(1.0, duration * share)
-        start, end = t, min(t + seg_dur, duration)
-        lines.append(str(i))
-        lines.append(f"{format_srt_time(start)} --> {format_srt_time(end)}")
-        lines.append(chunk)
-        lines.append("")
-        t = end
-    out_path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def get_image_size(image_path: Path):
@@ -291,11 +254,11 @@ def prepare_scene_audio(narration_path: Path, sfx_keyword: str, add_sfx: bool,
 
 
 # =========================================================
-# بناء مقطع مشهد واحد (فيديو) لأي من الوضعين
+# بناء مقطع مشهد واحد (فيديو) لأي من الوضعين — بلا أي نص على الإطلاق
 # =========================================================
 def build_scene_clip(image_path: Path, audio_path: Path, duration: float,
-                      srt_path: Path, out_path: Path, mode: str,
-                      zoom: bool, subs: bool, crop_x=None):
+                      out_path: Path, mode: str, zoom: bool,
+                      crop_x=None, scene_index: int = 0):
     target_w, target_h = LANDSCAPE_SIZE if mode == MODE_LANDSCAPE else PORTRAIT_SIZE
     frames = max(1, int(round(duration * FPS)))
 
@@ -307,24 +270,32 @@ def build_scene_clip(image_path: Path, audio_path: Path, duration: float,
         filters.append(f"crop={target_w}:{target_h}")
 
     if zoom:
+        # تأثير Ken Burns: يتناوب بين تكبير وتصغير حسب رقم المشهد، ومتدرّج
+        # بمعدل محسوب من عدد إطارات هذا المشهد تحديداً بحيث يصل بالضبط
+        # لأقصى/أدنى تكبير مع آخر إطار (بدل معدل ثابت يتوقف مبكراً ويترك
+        # بقية المشهد ثابتاً). الزوم مركزي (Anchor في منتصف الصورة) مع
+        # انزياح أفقي طفيف (Pan) لإحساس حركة كاميرا أكثر حيوية.
+        zoom_in = (scene_index % 2 == 0)
+        zoom_start, zoom_end = (1.0, 1.12) if zoom_in else (1.12, 1.0)
+        step = abs(zoom_end - zoom_start) / max(1, frames - 1)
+        pan_px = 45  # انزياح أفقي أقصى بالبكسل، آمن ضمن هامش الزوم المتاح
+
+        if zoom_in:
+            z_expr = f"min(zoom+{step:.6f},{zoom_end})"
+        else:
+            z_expr = f"if(eq(on,0),{zoom_start},max(zoom-{step:.6f},{zoom_end}))"
+
+        pan_expr = f"(on/{max(1, frames - 1)})*{pan_px}"
+        pan_sign = "+" if scene_index % 4 < 2 else "-"
+        x_expr = f"iw/2-(iw/zoom/2){pan_sign}({pan_expr})"
+        y_expr = "ih/2-(ih/zoom/2)"
+
         filters.append(
-            f"zoompan=z='min(zoom+0.0012,1.15)':d={frames}:s={target_w}x{target_h}:fps={FPS}"
+            f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':"
+            f"d={frames}:s={target_w}x{target_h}:fps={FPS}"
         )
     else:
         filters.append(f"fps={FPS}")
-
-    if subs and srt_path.exists() and srt_path.stat().st_size > 0:
-        srt_escaped = str(srt_path).replace("\\", "/").replace(":", "\\:")
-        # في الوضع العمودي تُرفع الترجمة قليلاً عن الأسفل لتفادي حجب الوجوه
-        # ولتبقى ضمن المنطقة الآمنة بعيداً عن أزرار واجهة تطبيقات Shorts.
-        margin_v = 60 if mode == MODE_LANDSCAPE else 110
-        font_size = 26 if mode == MODE_LANDSCAPE else 20
-        style = (
-            f"FontName=Noto Sans Arabic,FontSize={font_size},PrimaryColour=&H00FFFFFF,"
-            f"OutlineColour=&H00000000,BorderStyle=3,Outline=2,Shadow=0,"
-            f"Alignment=2,MarginV={margin_v}"
-        )
-        filters.append(f"subtitles='{srt_escaped}':force_style='{style}'")
 
     vf = ",".join(filters)
 
@@ -404,7 +375,7 @@ if generate_clicked:
     if not shutil.which("ffmpeg"):
         st.error(
             "لم يتم العثور على ffmpeg على الخادم. تأكد من وجود ملف packages.txt "
-            "يحتوي على 'ffmpeg' و'fonts-noto' في جذر المستودع."
+            "يحتوي على 'ffmpeg' في جذر المستودع."
         )
         st.stop()
 
@@ -438,8 +409,8 @@ if generate_clicked:
                 "مركزي بسيط بدل القصّ الذكي حول الوجه."
             )
 
-        # 2) تجهيز بيانات كل مشهد (صوت + ترجمة + قصّ ذكي) مرة واحدة فقط،
-        #    ثم إعادة استخدامها في أي عدد من أوضاع الإخراج.
+        # 2) تجهيز بيانات كل مشهد (صوت + قصّ ذكي) مرة واحدة فقط، ثم إعادة
+        #    استخدامها في أي عدد من أوضاع الإخراج.
         scene_data = []
         for i, scene in enumerate(scenes):
             n = scene.get("scene_number", i + 1)
@@ -464,10 +435,6 @@ if generate_clicked:
                 narration_audio_path, sfx_keyword, add_sfx, workdir, i
             )
 
-            srt_path = workdir / f"sub_{i}.srt"
-            if add_subs:
-                build_scene_srt(scene.get("narration", ""), duration, srt_path)
-
             crop_x = None
             if MODE_PORTRAIT in output_modes:
                 size = get_image_size(image_path)
@@ -481,7 +448,6 @@ if generate_clicked:
                 "image_path": image_path,
                 "audio_path": scene_audio_path,
                 "duration": duration,
-                "srt_path": srt_path,
                 "crop_x": crop_x,
             })
 
@@ -499,8 +465,9 @@ if generate_clicked:
                 )
                 clip_path = workdir / f"scene_{s['index']}_{mode}.mp4"
                 build_scene_clip(
-                    s["image_path"], s["audio_path"], s["duration"], s["srt_path"],
-                    clip_path, mode, zoom_effect, add_subs, crop_x=s["crop_x"],
+                    s["image_path"], s["audio_path"], s["duration"],
+                    clip_path, mode, zoom_effect, crop_x=s["crop_x"],
+                    scene_index=s["index"],
                 )
                 clip_paths.append(clip_path)
 
@@ -558,14 +525,18 @@ with st.expander("ℹ️ ملاحظات مهمة"):
 - الملف المضغوط يجب أن يحتوي على `story.json` ومجلدي `images/` و`audio/` بنفس أسماء المشاهد
   (`scene_1.png`, `scene_1.wav`, ...) كما تنتجه أداة توليد القصص.
 - عند النشر على **Streamlit Community Cloud** تأكد من وجود ملف `packages.txt` يحتوي على
-  السطرين `ffmpeg` و`fonts-noto` لضمان عمل حرق الترجمة العربية بشكل صحيح.
+  `ffmpeg` في جذر المستودع.
+- **لا توجد أي ترجمة أو نصوص مكتوبة على الفيديو إطلاقاً** — الصورة نظيفة تماماً،
+  مناسبة لجمهور الأطفال في سن ما قبل المدرسة.
 - كل مشهد يُعرض طوال مدة صوت السرد الخاص به بالضبط (عبر ffprobe)، مع تأثير
-  تكبير بطيء اختياري وترجمة نصية اختيارية.
+  تحريك كاميرا (Zoom & Pan) هادئ يتناوب تكبيراً/تصغيراً بين المشاهد لإحساس
+  أكثر حيوية، ومتدرّج على طول كامل مدة المشهد (لا يتوقف مبكراً).
 - **لا تُضاف أي موسيقى خلفية إطلاقاً.** المؤثرات الصوتية الطبيعية (عصافير،
-  مطر، ضحكات أطفال...) اختيارية تماماً، ولا تعمل إلا إذا وضعت الملفات
-  الفعلية بنفسك داخل مجلد `sfx_library/` بجانب app.py بهذه الأسماء بالضبط:
-  `birds.mp3`, `rain.mp3`, `door_open.mp3`, `children_laughing.mp3`,
-  `footsteps.mp3`, `wind.mp3`. أي مؤثر غير موجود يُتجاهل بصمت دون أي خطأ.
+  مطر، ضحكات أطفال، مكعبات...) اختيارية تماماً، ولا تعمل إلا إذا وضعت
+  الملفات الفعلية بنفسك داخل مجلد `sfx_library/` بجانب app.py بهذه الأسماء
+  بالضبط: `birds.mp3`, `rain.mp3`, `door_open.mp3`,
+  `children_laughing.mp3`, `footsteps.mp3`, `wind.mp3`, `blocks.mp3`.
+  أي مؤثر غير موجود يُتجاهل بصمت دون أي خطأ.
 - مقاطع **Shorts (9:16)** تُقصّ تلقائياً حول أكبر وجه مكتشف في الصورة
   (عبر OpenCV) إن وُجد، وإلا فيُستخدم القصّ المركزي كإجراء احتياطي.
 - إذا حددت مدة قصوى للمقطع أكبر من صفر، سيتم تقسيم كل وضع إخراج إلى عدة
