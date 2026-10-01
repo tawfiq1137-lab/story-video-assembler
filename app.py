@@ -1,125 +1,66 @@
 # -*- coding: utf-8 -*-
 """
-مُجمّع القصص المصورة إلى فيديو (16:9 و/أو Shorts عمودي 9:16)
-====================================================
-يستقبل ملف ZIP الناتج من أداة توليد القصص (story.json + images/ + audio/)
-ويجمّعه في فيديو نهائي، مع دعم مخرجين:
-  - الفيديو الرئيسي بعرض 16:9 (لليوتيوب).
-  - مقاطع Shorts/Reels عمودية 9:16 مع قصّ تلقائي "ذكي" حول الوجه إن أمكن.
+أداة تقطيع وتحويل الفيديو الرئيسي إلى مقاطع Shorts عمودية (9:16)
+================================================================
+تستقبل ملف فيديو رئيسي واحد (MP4) وتُخرج عدة مقاطع Shorts جاهزة:
+  - تحويل الأبعاد إلى عمودي (9:16) عبر خلفية مموّهة (Blurred Background
+    Padding) حول الفيديو الأصلي كاملاً، بدون أي اقتصاص أو تشويه للمحتوى.
+  - تقطيع الفيديو الطويل تلقائياً إلى أجزاء متتالية (Part 1, Part 2, ...)
+    بطول محدد (افتراضياً حوالي 55 ثانية)، عبر مُقسِّم FFmpeg المدمج
+    (segment)، بنسخ مباشر للترميز (-c copy) لأعلى سرعة.
 
-بلا أي ترجمة أو نصوص مكتوبة على الفيديو إطلاقاً (الجمهور أطفال ما قبل
-المدرسة) — الصورة نظيفة تماماً بلا أي طبقة نص. يضمن الكود تطابق مدة عرض
-كل مشهد مع مدة الصوت الخاصة به تماماً (audio duration عبر ffprobe)، مع
-تأثير تحريك كاميرا (Zoom & Pan) ديناميكي هادئ لكل مشهد، ولا يضيف أي
-موسيقى خلفية إطلاقاً، مع دعم اختياري لمؤثرات صوتية طبيعية إن توفرت
-ملفاتها محلياً في مجلد sfx_library/.
+لا يوجد أي استخدام لـ MoviePy في هذا الملف إطلاقاً — كل العمليات أوامر
+FFmpeg مباشرة عبر subprocess، لتفادي أي بطء أو Throttling على خادم
+Streamlit Community Cloud المحدود الموارد.
 """
 
-import json
 import re
 import shutil
 import subprocess
 import tempfile
-import zipfile
 from pathlib import Path
 
 import streamlit as st
 
-try:
-    from PIL import Image
-    _PIL_AVAILABLE = True
-except ImportError:
-    _PIL_AVAILABLE = False
-
-try:
-    import cv2
-    _CV2_AVAILABLE = True
-except ImportError:
-    _CV2_AVAILABLE = False
-
-
 st.set_page_config(
-    page_title="مُجمّع القصص إلى فيديو",
-    page_icon="🎬",
+    page_title="مُقطّع Shorts",
+    page_icon="✂️",
     layout="centered",
     initial_sidebar_state="collapsed",
 )
 
-st.markdown(
-    """
-    <style>
-    .stButton>button { height: 3em; font-size: 1.1em; border-radius: 10px; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-st.title("🎬 مُجمّع القصص إلى فيديو")
+st.title("✂️ مُقطّع Shorts (تحويل عمودي + تقطيع تلقائي)")
 st.caption(
-    "ارفع ملف الـ ZIP الناتج من أداة توليد القصة (نص + صور + صوت)، "
-    "واختر الفيديو الرئيسي (16:9) و/أو مقاطع Shorts عمودية (9:16) بقصّ "
-    "تلقائي. صورة نظيفة بلا أي ترجمة أو نصوص، وبدون أي موسيقى خلفية."
+    "ارفع الفيديو الرئيسي الجاهز (16:9)، وستحصل على عدة مقاطع عمودية "
+    "(9:16) جاهزة للنشر كـ Shorts/Reels، بخلفية مموّهة بدل الاقتصاص، "
+    "مقسّمة تلقائياً إلى أجزاء متتالية."
 )
 
 # --------------------------------------------------------------------------
 # إعدادات ثابتة
 # --------------------------------------------------------------------------
-FPS = 25
-LANDSCAPE_SIZE = (1920, 1080)   # 16:9
-PORTRAIT_SIZE = (1080, 1920)   # 9:16
+PORTRAIT_W, PORTRAIT_H = 1080, 1920
 
-SFX_LIBRARY_DIR = Path(__file__).resolve().parent / "sfx_library"
-SFX_FILENAMES = {
-    "birds": "birds.mp3",
-    "rain": "rain.mp3",
-    "door_open": "door_open.mp3",
-    "children_laughing": "children_laughing.mp3",
-    "footsteps": "footsteps.mp3",
-    "wind": "wind.mp3",
-    "blocks": "blocks.mp3",
-}
-
-MODE_LANDSCAPE = "landscape"
-MODE_PORTRAIT = "portrait"
-
-OUTPUT_CHOICES = {
-    "الفيديو الرئيسي فقط (16:9)": (MODE_LANDSCAPE,),
-    "مقاطع Shorts فقط (9:16)": (MODE_PORTRAIT,),
-    "كلاهما معاً": (MODE_LANDSCAPE, MODE_PORTRAIT),
-}
-
-MODE_LABELS = {
-    MODE_LANDSCAPE: "الفيديو الرئيسي (16:9)",
-    MODE_PORTRAIT: "Shorts عمودي (9:16)",
+PRESETS = {
+    "سريع (أقل جودة قليلاً)": ("veryfast", 26),
+    "متوازن": ("fast", 23),
+    "أعلى جودة (أبطأ)": ("medium", 20),
 }
 
 with st.sidebar:
     st.header("⚙️ الإعدادات")
-    output_choice_label = st.radio("نوع المخرج", list(OUTPUT_CHOICES.keys()), index=2)
-    zoom_effect = st.checkbox("تأثير تحريك كاميرا هادئ (Ken Burns Zoom & Pan)", value=True)
-    add_sfx = st.checkbox(
-        "إضافة مؤثرات صوتية طبيعية إن توفرت ملفاتها (بدون أي موسيقى إطلاقاً)",
-        value=True,
-    )
-    smart_crop = st.checkbox(
-        "قصّ ذكي حول الوجه لمقاطع Shorts (يتطلب opencv)",
-        value=True,
-        disabled=not _CV2_AVAILABLE,
-        help=None if _CV2_AVAILABLE else "مكتبة opencv-python-headless غير مثبتة على الخادم.",
-    )
-    max_clip_seconds = st.slider(
-        "أقصى مدة لكل مقطع (ثانية) — 0 يعني بدون تقسيم",
-        0, 180, 0, step=10,
+    segment_seconds = st.slider("مدة كل جزء (ثانية)", 20, 90, 55, step=5)
+    blur_strength = st.slider("قوة تمويه الخلفية", 5, 40, 20, step=5)
+    output_quality = st.selectbox(
+        "جودة الإخراج", list(PRESETS.keys()), index=1
     )
 
-output_modes = OUTPUT_CHOICES[output_choice_label]
-
-uploaded_zip = st.file_uploader("📦 ارفع ملف ZIP القصة", type=["zip"])
-generate_clicked = st.button("🚀 إنشاء الفيديو", use_container_width=True, type="primary")
+uploaded_video = st.file_uploader("🎬 ارفع الفيديو الرئيسي", type=["mp4", "mov", "m4v"])
+process_clicked = st.button("🚀 تحويل وتقطيع", use_container_width=True, type="primary")
 
 
 # =========================================================
-# دوال مساعدة عامة
+# دوال مساعدة
 # =========================================================
 
 def run_cmd(cmd: list, desc: str = ""):
@@ -129,234 +70,42 @@ def run_cmd(cmd: list, desc: str = ""):
     return result
 
 
-def get_duration(media_path: Path) -> float:
-    """مدة ملف الصوت/الفيديو بدقة عبر ffprobe — هي المرجع الوحيد لطول كل مشهد."""
+def get_duration(path: Path) -> float:
     result = run_cmd(
         [
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1", str(media_path),
+            "-of", "default=noprint_wrappers=1:nokey=1", str(path),
         ],
-        "قراءة مدة الملف",
+        "قراءة مدة الفيديو",
     )
     return float(result.stdout.strip())
 
 
-def get_image_size(image_path: Path):
-    if not _PIL_AVAILABLE:
-        return None
+def get_fps(path: Path) -> float:
+    result = run_cmd(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=r_frame_rate",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+        ],
+        "قراءة معدل الإطارات",
+    )
+    num, _, den = result.stdout.strip().partition("/")
     try:
-        with Image.open(image_path) as img:
-            return img.size  # (width, height)
-    except Exception:
-        return None
+        return float(num) / float(den or 1)
+    except (ValueError, ZeroDivisionError):
+        return 30.0
 
 
-# =========================================================
-# القصّ الذكي حول الوجه (لمقاطع 9:16 فقط)
-# =========================================================
-_face_cascade = None
-
-
-def _get_face_cascade():
-    global _face_cascade
-    if _face_cascade is None and _CV2_AVAILABLE:
-        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        _face_cascade = cv2.CascadeClassifier(cascade_path)
-    return _face_cascade
-
-
-def detect_face_center_ratio(image_path: Path):
-    """
-    يحاول كشف أكبر وجه في الصورة، ويعيد نسبة موقعه الأفقي (0.0 إلى 1.0)
-    بالنسبة لعرض الصورة الأصلية، أو None إن تعذّر الكشف.
-    """
-    if not _CV2_AVAILABLE:
-        return None
-    try:
-        img = cv2.imread(str(image_path))
-        if img is None:
-            return None
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        cascade = _get_face_cascade()
-        faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
-        if len(faces) == 0:
-            return None
-        largest = max(faces, key=lambda f: f[2] * f[3])
-        x, y, w, h = largest
-        face_center_x = x + w / 2.0
-        img_w = img.shape[1]
-        if img_w <= 0:
-            return None
-        return face_center_x / img_w
-    except Exception:
-        return None
-
-
-def compute_portrait_crop_x(orig_w: int, orig_h: int, face_center_ratio) -> float:
-    """
-    يحسب إحداثي x (بمقياس الصورة بعد تكبيرها لتغطية 1080x1920) الذي يجعل
-    نافذة القصّ 1080x1920 متمركزة حول الوجه المكتشف، مع البقاء داخل حدود
-    الصورة المُكبَّرة. إن لم يوجد وجه، يُستخدم المنتصف الأفقي كإجراء احتياطي.
-    """
-    target_w, target_h = PORTRAIT_SIZE
-    scale = max(target_w / orig_w, target_h / orig_h)
-    scaled_w = orig_w * scale
-
-    ratio = 0.5 if face_center_ratio is None else face_center_ratio
-    face_center_scaled_x = ratio * scaled_w
-
-    x = face_center_scaled_x - target_w / 2.0
-    x = max(0.0, min(x, max(0.0, scaled_w - target_w)))
-    return x
-
-
-# =========================================================
-# مزج المؤثرات الصوتية الاختيارية (بدون أي موسيقى)
-# =========================================================
-def prepare_scene_audio(narration_path: Path, sfx_keyword: str, add_sfx: bool,
-                         workdir: Path, idx: int) -> Path:
-    """
-    إن كان هناك مؤثر صوتي مناسب مذكور في story.json (sfx) وتوفّر ملفه
-    فعلياً داخل sfx_library/، يُمزج بمستوى صوت منخفض تحت التعليق الصوتي
-    ضمن نفس مدة السرد بالضبط (لا يُطوَّل المشهد بسبب المؤثر). إن لم يتوفر
-    الملف، يُتجاهل الأمر بصمت ويُستخدم صوت السرد كما هو (بدون أي موسيقى).
-    """
-    if not add_sfx or not sfx_keyword or sfx_keyword == "none":
-        return narration_path
-
-    sfx_filename = SFX_FILENAMES.get(sfx_keyword)
-    if not sfx_filename:
-        return narration_path
-
-    sfx_path = SFX_LIBRARY_DIR / sfx_filename
-    if not sfx_path.exists():
-        return narration_path
-
-    duration = get_duration(narration_path)
-    mixed_path = workdir / f"scene_{idx}_mixed.wav"
-
-    run_cmd(
+def has_audio_stream(path: Path) -> bool:
+    result = subprocess.run(
         [
-            "ffmpeg", "-y",
-            "-i", str(narration_path),
-            "-stream_loop", "-1", "-i", str(sfx_path),
-            "-filter_complex",
-            f"[1:a]volume=0.18,atrim=0:{duration}[sfx];"
-            f"[0:a][sfx]amix=inputs=2:duration=first:dropout_transition=0[aout]",
-            "-map", "[aout]",
-            "-t", str(duration),
-            "-c:a", "pcm_s16le",
-            str(mixed_path),
+            "ffprobe", "-v", "error", "-select_streams", "a",
+            "-show_entries", "stream=index", "-of", "csv=p=0", str(path),
         ],
-        f"مزج المؤثر الصوتي للمشهد {idx}",
+        capture_output=True, text=True,
     )
-    return mixed_path
-
-
-# =========================================================
-# بناء مقطع مشهد واحد (فيديو) لأي من الوضعين — بلا أي نص على الإطلاق
-# =========================================================
-def build_scene_clip(image_path: Path, audio_path: Path, duration: float,
-                      out_path: Path, mode: str, zoom: bool,
-                      crop_x=None, scene_index: int = 0):
-    target_w, target_h = LANDSCAPE_SIZE if mode == MODE_LANDSCAPE else PORTRAIT_SIZE
-    frames = max(1, int(round(duration * FPS)))
-
-    filters = [f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase"]
-
-    if mode == MODE_PORTRAIT and crop_x is not None:
-        filters.append(f"crop={target_w}:{target_h}:{crop_x:.0f}:(ih-{target_h})/2")
-    else:
-        filters.append(f"crop={target_w}:{target_h}")
-
-    if zoom:
-        # تأثير Ken Burns: يتناوب بين تكبير وتصغير حسب رقم المشهد، ومتدرّج
-        # بمعدل محسوب من عدد إطارات هذا المشهد تحديداً بحيث يصل بالضبط
-        # لأقصى/أدنى تكبير مع آخر إطار (بدل معدل ثابت يتوقف مبكراً ويترك
-        # بقية المشهد ثابتاً). الزوم مركزي (Anchor في منتصف الصورة) مع
-        # انزياح أفقي طفيف (Pan) لإحساس حركة كاميرا أكثر حيوية.
-        zoom_in = (scene_index % 2 == 0)
-        zoom_start, zoom_end = (1.0, 1.12) if zoom_in else (1.12, 1.0)
-        step = abs(zoom_end - zoom_start) / max(1, frames - 1)
-        pan_px = 45  # انزياح أفقي أقصى بالبكسل، آمن ضمن هامش الزوم المتاح
-
-        if zoom_in:
-            z_expr = f"min(zoom+{step:.6f},{zoom_end})"
-        else:
-            z_expr = f"if(eq(on,0),{zoom_start},max(zoom-{step:.6f},{zoom_end}))"
-
-        pan_expr = f"(on/{max(1, frames - 1)})*{pan_px}"
-        pan_sign = "+" if scene_index % 4 < 2 else "-"
-        x_expr = f"iw/2-(iw/zoom/2){pan_sign}({pan_expr})"
-        y_expr = "ih/2-(ih/zoom/2)"
-
-        filters.append(
-            f"zoompan=z='{z_expr}':x='{x_expr}':y='{y_expr}':"
-            f"d={frames}:s={target_w}x{target_h}:fps={FPS}"
-        )
-    else:
-        filters.append(f"fps={FPS}")
-
-    vf = ",".join(filters)
-
-    run_cmd(
-        [
-            "ffmpeg", "-y",
-            "-loop", "1", "-i", str(image_path),
-            "-i", str(audio_path),
-            "-vf", vf,
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-pix_fmt", "yuv420p", "-r", str(FPS),
-            "-c:a", "aac", "-b:a", "128k",
-            "-shortest",
-            str(out_path),
-        ],
-        f"بناء مشهد {image_path.name} ({MODE_LABELS[mode]})",
-    )
-
-
-def concat_clips(clip_paths: list, out_path: Path):
-    """يدمج المقاطع بإعادة الترميز (أكثر أماناً وتوافقاً من النسخ المباشر)."""
-    if len(clip_paths) == 1:
-        shutil.copy(clip_paths[0], out_path)
-        return
-
-    inputs = []
-    for p in clip_paths:
-        inputs += ["-i", str(p)]
-
-    n = len(clip_paths)
-    filter_parts = "".join(f"[{i}:v:0][{i}:a:0]" for i in range(n))
-    filter_complex = f"{filter_parts}concat=n={n}:v=1:a=1[outv][outa]"
-
-    run_cmd(
-        [
-            "ffmpeg", "-y", *inputs,
-            "-filter_complex", filter_complex,
-            "-map", "[outv]", "-map", "[outa]",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "23", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "128k",
-            str(out_path),
-        ],
-        "دمج المقاطع",
-    )
-
-
-def group_scenes_by_duration(scene_durations: list, max_seconds: int):
-    """يقسّم قائمة المدد إلى مجموعات لا تتجاوز كل منها max_seconds."""
-    if max_seconds <= 0:
-        return [list(range(len(scene_durations)))]
-
-    groups, current, current_total = [], [], 0.0
-    for i, d in enumerate(scene_durations):
-        if current and current_total + d > max_seconds:
-            groups.append(current)
-            current, current_total = [], 0.0
-        current.append(i)
-        current_total += d
-    if current:
-        groups.append(current)
-    return groups
+    return bool(result.stdout.strip())
 
 
 def sanitize_filename(name: str) -> str:
@@ -365,12 +114,66 @@ def sanitize_filename(name: str) -> str:
     return name[:60] or "video"
 
 
+def build_vertical_blurred(input_path: Path, out_path: Path, preset: str, crf: int,
+                            blur_sigma: int, fps: float, with_audio: bool):
+    """
+    يبني نسخة عمودية (1080x1920) من الفيديو كاملاً دون أي اقتصاص أو تشويه:
+    - طبقة خلفية: نفس الفيديو مُكبَّر ليملأ الإطار بالكامل + تمويه قوي.
+    - طبقة أمامية: نفس الفيديو بحجمه الطبيعي (محافظاً على نسبته الأصلية
+      كاملة) وفي وسط الإطار، فيظهر المحتوى كاملاً بلا أي اقتصاص.
+    فاصل الإطارات المرجعية (-g) يُضبط على ثانيتين لضمان تقطيع لاحق نظيف
+    وسريع في خطوة split_into_parts.
+    """
+    gop = max(1, int(round(fps * 2)))
+    filter_complex = (
+        f"[0:v]scale={PORTRAIT_W}:{PORTRAIT_H}:force_original_aspect_ratio=increase,"
+        f"crop={PORTRAIT_W}:{PORTRAIT_H},gblur=sigma={blur_sigma}[bg];"
+        f"[0:v]scale={PORTRAIT_W}:{PORTRAIT_H}:force_original_aspect_ratio=decrease[fg];"
+        f"[bg][fg]overlay=(W-w)/2:(H-h)/2:format=auto[outv]"
+    )
+
+    cmd = [
+        "ffmpeg", "-y", "-i", str(input_path),
+        "-filter_complex", filter_complex,
+        "-map", "[outv]",
+    ]
+    if with_audio:
+        cmd += ["-map", "0:a:0", "-c:a", "aac", "-b:a", "128k"]
+    cmd += [
+        "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
+        "-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "0",
+        "-pix_fmt", "yuv420p",
+        str(out_path),
+    ]
+    run_cmd(cmd, "تحويل الفيديو إلى عمودي بخلفية مموّهة")
+
+
+def split_into_parts(input_path: Path, out_dir: Path, base_name: str, segment_seconds: int):
+    """
+    يقسّم الفيديو العمودي إلى أجزاء متتالية عبر مُقسِّم FFmpeg المدمج
+    (segment) بنسخ الترميز مباشرة (-c copy) بدل إعادة الترميز، فيكون
+    التقطيع شبه فوري بغض النظر عن طول الفيديو.
+    """
+    pattern = out_dir / f"{base_name}_part%03d.mp4"
+    run_cmd(
+        [
+            "ffmpeg", "-y", "-i", str(input_path),
+            "-c", "copy", "-map", "0",
+            "-f", "segment", "-segment_time", str(segment_seconds),
+            "-reset_timestamps", "1",
+            str(pattern),
+        ],
+        "تقطيع الفيديو إلى أجزاء",
+    )
+    return sorted(out_dir.glob(f"{base_name}_part*.mp4"))
+
+
 # =========================================================
 # المنطق الرئيسي
 # =========================================================
-if generate_clicked:
-    if not uploaded_zip:
-        st.error("الرجاء رفع ملف ZIP أولاً.")
+if process_clicked:
+    if not uploaded_video:
+        st.error("الرجاء رفع ملف الفيديو أولاً.")
         st.stop()
     if not shutil.which("ffmpeg"):
         st.error(
@@ -379,140 +182,52 @@ if generate_clicked:
         )
         st.stop()
 
-    workdir = Path(tempfile.mkdtemp(prefix="assembler_"))
+    workdir = Path(tempfile.mkdtemp(prefix="shorts_"))
     status = st.status("جاري المعالجة...", expanded=True)
 
     try:
-        # 1) فك ضغط الملف
-        status.update(label="📦 جاري فك ضغط الملف...")
-        zip_path = workdir / "story.zip"
-        zip_path.write_bytes(uploaded_zip.read())
-        extract_dir = workdir / "extracted"
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(extract_dir)
+        status.update(label="📥 جاري حفظ الملف المرفوع...")
+        input_path = workdir / "input.mp4"
+        input_path.write_bytes(uploaded_video.read())
 
-        story_json_path = next(extract_dir.rglob("story.json"), None)
-        if not story_json_path:
-            raise FileNotFoundError("لم يتم العثور على story.json داخل الملف المضغوط.")
+        original_name = Path(uploaded_video.name).stem
+        base_name = sanitize_filename(original_name)
 
-        story = json.loads(story_json_path.read_text(encoding="utf-8"))
-        base_dir = story_json_path.parent
-        scenes = story.get("scenes", [])
-        if not scenes:
-            raise ValueError("لم يتم العثور على أي مشاهد (scenes) داخل story.json.")
+        duration = get_duration(input_path)
+        fps = get_fps(input_path)
+        with_audio = has_audio_stream(input_path)
+        preset, crf = PRESETS[output_quality]
 
-        title = story.get("title", "قصة")
+        status.update(
+            label=f"🎨 جاري التحويل إلى عمودي (9:16) بخلفية مموّهة... (المدة الكلية: {duration:.0f}ث)"
+        )
+        vertical_path = workdir / "vertical.mp4"
+        build_vertical_blurred(input_path, vertical_path, preset, crf, blur_strength, fps, with_audio)
 
-        if MODE_PORTRAIT in output_modes and smart_crop and not _CV2_AVAILABLE:
-            st.warning(
-                "⚠️ مكتبة opencv-python-headless غير متوفرة، سيُستخدم قصّ "
-                "مركزي بسيط بدل القصّ الذكي حول الوجه."
-            )
+        status.update(label="✂️ جاري تقطيع الفيديو إلى أجزاء...")
+        parts = split_into_parts(vertical_path, workdir, base_name, segment_seconds)
 
-        # 2) تجهيز بيانات كل مشهد (صوت + قصّ ذكي) مرة واحدة فقط، ثم إعادة
-        #    استخدامها في أي عدد من أوضاع الإخراج.
-        scene_data = []
-        for i, scene in enumerate(scenes):
-            n = scene.get("scene_number", i + 1)
-            status.update(label=f"✂️ جاري تجهيز المشهد {i + 1}/{len(scenes)}...")
+        if not parts:
+            raise RuntimeError("لم ينتج أي جزء بعد التقطيع.")
 
-            image_candidates = [p for p in base_dir.rglob(f"scene_{n}.*")
-                                 if p.suffix.lower() in (".png", ".jpg", ".jpeg")]
-            audio_candidates = [p for p in base_dir.rglob(f"scene_{n}.*")
-                                 if p.suffix.lower() in (".wav", ".mp3", ".m4a")]
+        status.update(label=f"✅ اكتمل! تم إنتاج {len(parts)} جزء.", state="complete")
 
-            if not image_candidates or not audio_candidates:
-                raise FileNotFoundError(f"ملفات ناقصة للمشهد رقم {n}.")
-
-            image_path = image_candidates[0]
-            narration_audio_path = audio_candidates[0]
-
-            # مدة المشهد = مدة صوت السرد الأصلي بالضبط (مرجع المزامنة الوحيد)
-            duration = get_duration(narration_audio_path)
-
-            sfx_keyword = scene.get("sfx", "none")
-            scene_audio_path = prepare_scene_audio(
-                narration_audio_path, sfx_keyword, add_sfx, workdir, i
-            )
-
-            crop_x = None
-            if MODE_PORTRAIT in output_modes:
-                size = get_image_size(image_path)
-                if size:
-                    orig_w, orig_h = size
-                    face_ratio = detect_face_center_ratio(image_path) if smart_crop else None
-                    crop_x = compute_portrait_crop_x(orig_w, orig_h, face_ratio)
-
-            scene_data.append({
-                "index": i,
-                "image_path": image_path,
-                "audio_path": scene_audio_path,
-                "duration": duration,
-                "crop_x": crop_x,
-            })
-
-        scene_durations = [s["duration"] for s in scene_data]
-        groups = group_scenes_by_duration(scene_durations, max_clip_seconds)
-
-        # 3) بناء المخرجات لكل وضع مطلوب (16:9 و/أو 9:16)
-        all_results = {}
-        for mode in output_modes:
-            mode_label = MODE_LABELS[mode]
-            clip_paths = []
-            for s in scene_data:
-                status.update(
-                    label=f"🎬 جاري بناء مشهد {s['index'] + 1}/{len(scene_data)} — {mode_label}..."
+        st.success(f"تم إنشاء {len(parts)} مقطع Shorts جاهز 🎉")
+        for i, part_path in enumerate(parts, start=1):
+            part_duration = get_duration(part_path)
+            st.subheader(f"الجزء {i}")
+            st.caption(f"⏱️ المدة: {part_duration:.0f} ثانية")
+            st.video(str(part_path))
+            with open(part_path, "rb") as f:
+                st.download_button(
+                    label=f"⬇️ تنزيل الجزء {i}",
+                    data=f.read(),
+                    file_name=f"{base_name}_Part{i}.mp4",
+                    mime="video/mp4",
+                    use_container_width=True,
+                    key=f"dl_part_{i}",
                 )
-                clip_path = workdir / f"scene_{s['index']}_{mode}.mp4"
-                build_scene_clip(
-                    s["image_path"], s["audio_path"], s["duration"],
-                    clip_path, mode, zoom_effect, crop_x=s["crop_x"],
-                    scene_index=s["index"],
-                )
-                clip_paths.append(clip_path)
-
-            status.update(label=f"🧩 جاري دمج مشاهد {mode_label}...")
-            mode_results = []
-            for gi, group in enumerate(groups):
-                group_clips = [clip_paths[i] for i in group]
-                group_duration = sum(scene_durations[i] for i in group)
-                suffix = "_shorts" if mode == MODE_PORTRAIT else ""
-                out_name = (
-                    f"{sanitize_filename(title)}{suffix}_part{gi + 1}.mp4"
-                    if len(groups) > 1 else f"{sanitize_filename(title)}{suffix}.mp4"
-                )
-                out_path = workdir / out_name
-                concat_clips(group_clips, out_path)
-                mode_results.append({"path": out_path, "duration": group_duration, "index": gi + 1})
-
-            all_results[mode] = mode_results
-
-        status.update(label="✅ اكتمل الإنشاء بنجاح!", state="complete")
-
-        # 4) عرض النتائج (تبويب لكل وضع إن كان الاثنان مطلوبين معاً)
-        if len(output_modes) > 1:
-            tabs = st.tabs([MODE_LABELS[m] for m in output_modes])
-        else:
-            tabs = [st.container()]
-
-        for mode, tab in zip(output_modes, tabs):
-            with tab:
-                results = all_results[mode]
-                st.success(f"تم إنشاء {len(results)} فيديو ({MODE_LABELS[mode]}) 🎉")
-                for r in results:
-                    st.subheader(f"الجزء {r['index']}" if len(results) > 1 else title)
-                    st.caption(f"⏱️ المدة: {r['duration']:.0f} ثانية")
-                    st.video(str(r["path"]))
-                    with open(r["path"], "rb") as f:
-                        st.download_button(
-                            label="⬇️ تنزيل الفيديو",
-                            data=f.read(),
-                            file_name=r["path"].name,
-                            mime="video/mp4",
-                            use_container_width=True,
-                            key=f"dl_{mode}_{r['index']}",
-                        )
-                    st.divider()
+            st.divider()
 
     except Exception as e:
         status.update(label="❌ حدث خطأ", state="error")
@@ -522,24 +237,21 @@ if generate_clicked:
 with st.expander("ℹ️ ملاحظات مهمة"):
     st.markdown(
         """
-- الملف المضغوط يجب أن يحتوي على `story.json` ومجلدي `images/` و`audio/` بنفس أسماء المشاهد
-  (`scene_1.png`, `scene_1.wav`, ...) كما تنتجه أداة توليد القصص.
-- عند النشر على **Streamlit Community Cloud** تأكد من وجود ملف `packages.txt` يحتوي على
-  `ffmpeg` في جذر المستودع.
-- **لا توجد أي ترجمة أو نصوص مكتوبة على الفيديو إطلاقاً** — الصورة نظيفة تماماً،
-  مناسبة لجمهور الأطفال في سن ما قبل المدرسة.
-- كل مشهد يُعرض طوال مدة صوت السرد الخاص به بالضبط (عبر ffprobe)، مع تأثير
-  تحريك كاميرا (Zoom & Pan) هادئ يتناوب تكبيراً/تصغيراً بين المشاهد لإحساس
-  أكثر حيوية، ومتدرّج على طول كامل مدة المشهد (لا يتوقف مبكراً).
-- **لا تُضاف أي موسيقى خلفية إطلاقاً.** المؤثرات الصوتية الطبيعية (عصافير،
-  مطر، ضحكات أطفال، مكعبات...) اختيارية تماماً، ولا تعمل إلا إذا وضعت
-  الملفات الفعلية بنفسك داخل مجلد `sfx_library/` بجانب app.py بهذه الأسماء
-  بالضبط: `birds.mp3`, `rain.mp3`, `door_open.mp3`,
-  `children_laughing.mp3`, `footsteps.mp3`, `wind.mp3`, `blocks.mp3`.
-  أي مؤثر غير موجود يُتجاهل بصمت دون أي خطأ.
-- مقاطع **Shorts (9:16)** تُقصّ تلقائياً حول أكبر وجه مكتشف في الصورة
-  (عبر OpenCV) إن وُجد، وإلا فيُستخدم القصّ المركزي كإجراء احتياطي.
-- إذا حددت مدة قصوى للمقطع أكبر من صفر، سيتم تقسيم كل وضع إخراج إلى عدة
-  فيديوهات، كل واحد لا يتجاوز تلك المدة (بحدود المشاهد الكاملة).
+- هذه الأداة تستقبل **فيديو رئيسي جاهز واحد (MP4)** وتُخرج منه عدة مقاطع
+  Shorts عمودية — هي لا تولّد صوراً أو صوتاً، فقط تحوّل وتقطّع فيديو جاهز.
+- **لا اقتصاص ولا تشويه للمحتوى الأصلي إطلاقاً**: يظهر الفيديو كاملاً
+  بحجمه الطبيعي في المنتصف، وتُملأ الحواف العلوية/السفلية بخلفية مموّهة
+  مأخوذة من نفس الفيديو (تقنية شائعة في أدوات تحويل المحتوى لـ Shorts).
+- التقطيع يستخدم `-c copy` (نسخ مباشر بلا إعادة ترميز) فهو سريع جداً مهما
+  طال الفيديو؛ إعادة الترميز الوحيدة تحدث مرة واحدة فقط أثناء خطوة
+  التحويل للوضع العمودي.
+- قد تختلف مدة كل جزء ببضع ثوانٍ عن الرقم المحدد بالضبط، لأن التقطيع
+  السريع (copy) يلتزم بأقرب إطار مرجعي (keyframe)؛ ضبطنا فاصل الإطارات
+  المرجعية على ثانيتين أثناء التحويل لتقليل هذا الفارق لأقصى حد.
+- عند النشر على Streamlit Community Cloud، تأكد من وجود `packages.txt`
+  يحتوي `ffmpeg` في جذر المستودع (نفس الموجود حالياً يكفي، ولا حاجة لأي
+  مكتبات بايثون إضافية غير streamlit نفسها).
+- لا علاقة لهذه الأداة بـ MoviePy إطلاقاً — تعتمد بالكامل على أوامر
+  FFmpeg المباشرة عبر `subprocess` لأعلى سرعة وأقل استهلاك للمعالج.
         """
     )
